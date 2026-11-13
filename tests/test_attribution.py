@@ -257,6 +257,15 @@ class TestRenderOnly:
 
 
 class TestConfig:
+    @pytest.fixture(autouse=True)
+    def _干净的环境(self, monkeypatch):
+        for key in (
+            "OMBRE_ATTRIBUTION_USER_NAMES",
+            "OMBRE_ATTRIBUTION_SELF_NAMES",
+            "AI_NAME",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
     def test_没有配置段时返回空表(self):
         assert names_from_config(None) == {"self_names": [], "user_names": []}
         assert names_from_config({}) == {"self_names": [], "user_names": []}
@@ -268,3 +277,32 @@ class TestConfig:
     def test_内置表始终生效(self):
         assert not is_third_party_speaker("用户")
         assert is_third_party_speaker("Zoey")
+
+    def test_环境变量补的称呼与配置段合并(self, monkeypatch):
+        monkeypatch.setenv("OMBRE_ATTRIBUTION_USER_NAMES", "Vessy, Vesper")
+        monkeypatch.setenv("OMBRE_ATTRIBUTION_SELF_NAMES", "Claude，Claudie")
+        names = names_from_config({"attribution": {"user_names": ["她"]}})
+        assert names["user_names"] == ["vesper", "vessy", "她"]
+        assert names["self_names"] == ["claude", "claudie"]
+
+    def test_human与ai_name算作对话两方(self, monkeypatch):
+        names = names_from_config({"human": "Vessy", "ai_name": "Claudie"})
+        assert names == {"self_names": ["claudie"], "user_names": ["vessy"]}
+        monkeypatch.setenv("AI_NAME", "Claude")
+        assert names_from_config({})["self_names"] == ["claude"]
+
+    def test_环境变量登记的用户不被拆成第三方(self, monkeypatch):
+        from tools import _runtime as rt
+        from tools.breath._verbatim import render_stored_bucket
+
+        monkeypatch.setenv("OMBRE_ATTRIBUTION_USER_NAMES", "Vessy,Vesper")
+        monkeypatch.setenv("OMBRE_ATTRIBUTION_SELF_NAMES", "Claude,Claudie")
+        monkeypatch.setattr(rt, "config", {}, raising=False)
+        bucket = {
+            "id": "b1",
+            "content": "她回来了。\nVessy: i'm staying",
+            "metadata": {"type": "dynamic", "quotes": [{"text": "x", "speaker": "Vessy"}]},
+        }
+        rendered, _ = render_stored_bucket(bucket, "[bucket_id:b1]")
+        assert "Vessy: i'm staying" in rendered
+        assert "non_user_speech" not in rendered

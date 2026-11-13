@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Iterable, Mapping
 
@@ -277,10 +278,28 @@ def names_from_config(config: Mapping[str, Any] | None) -> dict[str, list[str]]:
     breath 与 dream 两条渲染路径都调这里，共用同一份判定依据；各自维护一份的话，
     同一段正文在两处会拆出不同结果。
     """
-    section = config.get("attribution") if isinstance(config, Mapping) else None
+    config = config if isinstance(config, Mapping) else {}
+    section = config.get("attribution")
     if not isinstance(section, Mapping):
-        return {"self_names": [], "user_names": []}
+        section = {}
+    # 配置段之外再并三处来源，都只是补充、不替换：
+    # - 环境变量 OMBRE_ATTRIBUTION_USER_NAMES / OMBRE_ATTRIBUTION_SELF_NAMES（逗号分隔）
+    #   ——Dashboard 没有这一段的页面，托管平台上只有环境变量够得着；
+    # - `human` 是用户一方的称呼、`ai_name`（或 AI_NAME）是我这一侧的称呼，
+    #   按定义就是对话的两方，配了就不该被当成第三方。
+    user_names = _normalize_names(section.get("user_names"))
+    user_names |= _normalize_names(_env_names("OMBRE_ATTRIBUTION_USER_NAMES"))
+    user_names |= _normalize_names(config.get("human"))
+    self_names = _normalize_names(section.get("self_names"))
+    self_names |= _normalize_names(_env_names("OMBRE_ATTRIBUTION_SELF_NAMES"))
+    self_names |= _normalize_names(
+        config.get("ai_name") or os.environ.get("AI_NAME", "")
+    )
     return {
-        "self_names": sorted(_normalize_names(section.get("self_names"))),
-        "user_names": sorted(_normalize_names(section.get("user_names"))),
+        "self_names": sorted(self_names),
+        "user_names": sorted(user_names),
     }
+
+
+def _env_names(key: str) -> list[str]:
+    return re.split(r"[,，]", os.environ.get(key, ""))
