@@ -21,7 +21,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Iterator, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -38,7 +38,7 @@ from ombrebrain.them import (
     validate_them_snapshot_file,
 )
 from ombrebrain.you import YouStore, YouStoreError, validate_you_snapshot_file
-from utils import _win_long_path
+from utils import _project_root, _win_long_path, config_file_path
 
 logger = logging.getLogger("ombre_brain.github_sync")
 
@@ -53,6 +53,9 @@ _MAX_MANIFEST_PAYLOAD_BYTES = 4 * 1024 * 1024
 _MAX_MANIFEST_BASE64_BYTES = ((_MAX_MANIFEST_PAYLOAD_BYTES + 2) // 3) * 4 + 64 * 1024
 _MAX_RESTORE_TOTAL_BYTES = 512 * 1024 * 1024
 _MANIFEST_FILENAME = "_ombre_backup_manifest.json"
+# 最近一次成功备份的时间戳，落在 config.yaml 旁边（持久盘），重启后还认得。
+_LAST_SUCCESS_FILENAME = ".github_sync_last_success"
+_STALE_AFTER = timedelta(hours=24)
 _SOURCE_REFS_COMPLETE_FIELD = "source_refs_complete"
 _YOU_RELATIVE_PATH = ".you/you.sqlite3"
 _THEM_RELATIVE_PATH = ".them/them.sqlite3"
@@ -247,6 +250,9 @@ class GitHubSync:
         # A3：连续失败计数。自动备份可能连挂几次而用户毫无察觉（以为有备份其实没有）。
         # 每次成功归零、每次失败 +1，供诊断面板判断要不要升级为醒目告警。
         self.consecutive_failures: int = 0
+        # 备份静默停掉过几个月没人知道：last_sync 只活在内存里，重启就清零。
+        # last_success 只记上传成功的那一刻，并落盘，供 breath / pulse 报告备份年龄。
+        self.last_success: str | None = _read_last_success()
         # Manual and scheduled backups share one instance.  Serializing them
         # prevents two bounded jobs from adding up to an unbounded peak.
         self._sync_lock = asyncio.Lock()
@@ -280,6 +286,7 @@ class GitHubSync:
                         self.last_error = ""
                         self.last_sync = _now_iso()
                         self.last_count = 0
+                        self._record_success()
                         return {"ok": True, "uploaded": 0, "message": "无可同步文件"}
 
                     count = await self._batch_commit(files)
@@ -288,6 +295,7 @@ class GitHubSync:
                 self.last_error = ""
                 self.last_count = count
                 self.consecutive_failures = 0
+                self._record_success()
                 return {"ok": True, "uploaded": count}
             except Exception as e:
                 self.last_status = "error"
@@ -663,6 +671,10 @@ class GitHubSync:
                 }
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def _record_success(self) -> None:
+        self.last_success = self.last_sync
+        _write_last_success(self.last_success)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -1120,6 +1132,92 @@ class GitHubSync:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _last_success_path() -> str | None:
+    """config.yaml 所在目录；配置就在代码目录里时不落盘，免得写进仓库。"""
+    directory = os.path.dirname(os.path.abspath(config_file_path()))
+    if os.path.normcase(directory) == os.path.normcase(_project_root()):
+        return None
+    return os.path.join(directory, _LAST_SUCCESS_FILENAME)
+
+
+def _read_last_success() -> str | None:
+    path = _last_success_path()
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            stamp = fh.read().strip()
+        datetime.fromisoformat(stamp)
+        return stamp
+    except (OSError, ValueError):
+        return None
+
+
+def _write_last_success(stamp: str | None) -> None:
+    path = _last_success_path()
+    if not path or not stamp:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(stamp + "\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning(f"[github_sync] could not persist last success: {exc}")
+
+
+def _backup_age(instance: "GitHubSync | None", now: datetime | None):
+    """(状态, 距今, UTC 时间串)。状态：off | never | ok。"""
+    if instance is None or not (instance.token and instance.repo):
+        return "off", None, ""
+    if not instance.last_success:
+        return "never", None, ""
+    when = datetime.fromisoformat(instance.last_success).astimezone(timezone.utc)
+    age = max((now or datetime.now(timezone.utc)) - when, timedelta(0))
+    return "ok", age, when.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _format_age(age: timedelta) -> str:
+    minutes = int(age.total_seconds() // 60)
+    if minutes < 1:
+        return "just now"
+    for size, unit in ((1440, "day"), (60, "hour"), (1, "minute")):
+        if minutes >= size:
+            n = minutes // size
+            return f"{n} {unit}{'' if n == 1 else 's'} ago"
+    return "just now"
+
+
+def backup_status_line(instance: "GitHubSync | None", now: datetime | None = None) -> str:
+    """pulse 末尾那一行：上次成功备份是什么时候。"""
+    state, age, stamp = _backup_age(instance, now)
+    if state == "off":
+        return "GitHub backup: not configured."
+    if state == "never":
+        line = "GitHub backup: no successful sync since the last restart."
+    else:
+        line = f"GitHub backup: last success {_format_age(age)} ({stamp})."
+    if instance.consecutive_failures:
+        line += f" Last {instance.consecutive_failures} attempt(s) failed."
+    return line
+
+
+def backup_stale_warning(instance: "GitHubSync | None", now: datetime | None = None) -> str:
+    """breath 开头的警告；最近 24 小时内成功过、或压根没配同步，就返回空串。
+
+    没配同步是部署者的选择，pulse 那一行照样会说；breath 只为「配了却没备上」开口。
+    """
+    state, age, stamp = _backup_age(instance, now)
+    if state == "off":
+        return ""
+    if state == "never":
+        return "⚠️ BACKUP: no successful GitHub backup since the last restart."
+    if age < _STALE_AFTER:
+        return ""
+    return f"⚠️ BACKUP STALE: the last successful GitHub backup was {_format_age(age)} ({stamp})."
 
 
 def _is_empty_repo_response(resp: httpx.Response) -> bool:

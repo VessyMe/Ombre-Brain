@@ -263,7 +263,7 @@ them_service = ThemService(
 # 只删了订阅方，发射端空转了一整个大版本，而读代码的人会以为它还能挂钩子。
 
 # --- GitHub Sync / GitHub 同步 ---
-from github_sync import GitHubSync  # type: ignore
+from github_sync import GitHubSync, backup_stale_warning, backup_status_line  # type: ignore
 _gh_cfg = config.get("github_sync", {}) or {}
 _gh_token = (os.environ.get("OMBRE_GITHUB_TOKEN") or _gh_cfg.get("token") or "").strip()
 github_sync_instance: GitHubSync | None = (
@@ -705,12 +705,17 @@ async def breath(
     catalog: Optional[bool] = False,
 ) -> str:
     """无参数,睁眼看看自己记得什么:返回权重最高、未解决且未标记 digested 的记忆 + 置顶核心准则。digested 从默认/被动浮现及 dream 隐藏，仍可由 breath_search(query=...) 显式找回。0 参数是刻意设计——claude.ai 按需加载工具时会跳过参数复杂的工具,拆成 0 参数才能保证每次对话自动浮现,不用手动触发。要按关键词找记忆用 breath_search(query=...);要用 catalog/tags/importance_min/valence/arousal/max_tokens 等高级模式用 breath_advanced(...)。domain=只在某个主题域里找(逗号分隔),max_results=最多返回几条——这两个 breath 也认,但 breath 的本意就是不带参数睁眼看看。"""
-    return await _with_notice(
-        _t_breath.dispatch(
+    async def _breath_with_backup_warning() -> str:
+        text = await _t_breath.dispatch(
             query=query, max_tokens=max_tokens, domain=domain,
             valence=valence, arousal=arousal, max_results=max_results,
             importance_min=importance_min, tags=tags, catalog=catalog,
-        ),
+        )
+        warning = backup_stale_warning(_wsh.github_sync_instance)
+        return f"{warning}\n\n{text}" if warning else text
+
+    return await _with_notice(
+        _breath_with_backup_warning(),
         op="breath",
         args={
             "query": query, "max_tokens": max_tokens, "domain": domain,
@@ -1125,8 +1130,12 @@ async def release(bucket_id: str) -> str:
 @mcp.tool()
 async def pulse(include_archive: Optional[bool] = False) -> str:
     """返回记忆系统状态摘要:固化/动态/归档/feel/plan/letter 数量、总占用、衰减引擎运行状态,以及所有桶的摘要列表；anchor 行带独立 ⚓ [anchor] 冷参考标记。include_archive=True 同时返回归档区。"""
+    async def _pulse_with_backup_line() -> str:
+        text = await _t_anchor.pulse(include_archive=include_archive)
+        return f"{text}\n{backup_status_line(_wsh.github_sync_instance)}"
+
     return await _with_notice(
-        _t_anchor.pulse(include_archive=include_archive),
+        _pulse_with_backup_line(),
         op="pulse",
         args={"include_archive": include_archive},
     )
