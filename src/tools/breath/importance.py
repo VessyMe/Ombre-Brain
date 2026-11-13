@@ -11,7 +11,7 @@ tools/breath/importance.py — importance_min 模式
 - 列出所有非 feel/plan/letter、未主动遗忘、且 importance >= 阈值 的桶
 - tags 过滤同样生效（AND）
 - 按 importance 降序；若高分桶超过 20 条，仍保留阈值档位的最近更新桶
-- 截到 20 条后逐条 dehydrate，再塞进 max_tokens 预算
+- 截到 20 条后逐字返回存储正文，再塞进 max_tokens 预算
 
 不做什么（边界）：
 - 不做向量检索（这是「按重要度批量拉」而不是「找相似」）
@@ -21,25 +21,17 @@ tools/breath/importance.py — importance_min 模式
 ========================================
 """
 
+from datetime import datetime  # noqa: F401 —— 供签名注解使用
+
 from .. import _runtime as rt
-from utils import strip_wikilinks, count_tokens_approx
-from ._concurrent import dehydrate_many
+from .._common import is_importance_audit_candidate
+from ..plan.core import is_letter_bucket
+from ._date_range import bucket_in_created_range
+from ._shared import bucket_has_tags, footprint_reader
+from ._verbatim import render_stored_bucket
+from errors import safe_error_detail
 
-
-def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
-    if not tag_filter:
-        return True
-    bucket_tags = set(meta.get("tags", []) or [])
-    return all(t in bucket_tags for t in tag_filter)
-
-
-def _is_core_bucket(bucket: dict) -> bool:
-    meta = bucket.get("metadata", {}) or {}
-    return bool(meta.get("pinned") or meta.get("protected") or meta.get("type") == "permanent")
-
-
-def _raw_core_fallback(content: str) -> str:
-    return strip_wikilinks(content)[:300].strip() or "（空记忆）"
+_BUDGET_NOTICE = "token 预算不足：下一条重要记忆未被截断或摘要，请提高 max_tokens 后重试。"
 
 
 def _importance_of(bucket: dict) -> int:
@@ -58,6 +50,20 @@ def _importance_sort_key(bucket: dict):
     )
 
 
+def _deduplicate_buckets(buckets: list[dict]) -> list[dict]:
+    """Keep BucketManager's first canonical physical row for each logical ID."""
+    unique: list[dict] = []
+    seen_ids: set[str] = set()
+    for bucket in buckets:
+        bucket_id = str(bucket.get("id") or "").strip()
+        if bucket_id:
+            if bucket_id in seen_ids:
+                continue
+            seen_ids.add(bucket_id)
+        unique.append(bucket)
+    return unique
+
+
 def _select_importance_buckets(buckets: list[dict], importance_min: int, limit: int = 20) -> list[dict]:
     """Keep high-importance results useful even when one level fills the cap.
 
@@ -67,7 +73,11 @@ def _select_importance_buckets(buckets: list[dict], importance_min: int, limit: 
     eligible importance level first, then fill the rest by normal ranking.
     """
     limit = max(1, int(limit or 20))
-    ordered = sorted(buckets, key=_importance_sort_key, reverse=True)
+    # list_all() can expose historical/manual duplicate files with one logical
+    # bucket ID. Match BucketManager's first canonical row before limiting so
+    # both short and long result sets remain auditable against quota counts.
+    unique = _deduplicate_buckets(buckets)
+    ordered = sorted(unique, key=_importance_sort_key, reverse=True)
     if len(ordered) <= limit:
         return ordered
 
@@ -100,44 +110,56 @@ def _select_importance_buckets(buckets: list[dict], importance_min: int, limit: 
 
 
 async def surface_by_importance(
-    importance_min: int, max_tokens: int, tag_filter: list, max_results: int = 20
+    importance_min: int,
+    max_tokens: int,
+    tag_filter: list,
+    created_from: "datetime | None" = None,
+    created_to: "datetime | None" = None,
 ) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
-        return f"记忆系统暂时无法访问: {e}"
+        return f"记忆系统暂时无法访问: {safe_error_detail(e)}"
+    canonical_buckets = _deduplicate_buckets(all_buckets)
     filtered = [
-        b for b in all_buckets
-        if int(b.get("metadata", {}).get("importance") or 0) >= importance_min
-        and b.get("metadata", {}).get("type") not in ("feel", "plan", "letter")
-        and not b.get("metadata", {}).get("dont_surface", False)
-        and _bucket_has_tags(b.get("metadata", {}), tag_filter)
+        b for b in canonical_buckets
+        if is_importance_audit_candidate(
+            b.get("metadata", {}), importance_min
+        )
+        and not is_letter_bucket(b)
+        and bucket_has_tags(b.get("metadata", {}), tag_filter)
+        # 3.6.0：重要度审计也认时间区间。日期过滤必须在 20 条截断**之前**——
+        # 先截后滤会让「七月的高重要度记忆」变成「全库前 20 里恰好在七月的那几条」。
+        and bucket_in_created_range(b, created_from, created_to)
     ]
-    # 之前这里硬编码 limit=20，dispatch 传下来的 max_results 完全没生效——
-    # 调用方要 15 条还是 40 条，行为一模一样。
-    filtered = _select_importance_buckets(filtered, importance_min, limit=max_results)
+    filtered = _select_importance_buckets(filtered, importance_min, limit=20)
     if not filtered:
+        if created_from is not None or created_to is not None:
+            return f"这段时间里没有重要度 >= {importance_min} 的记忆。"
         return f"没有重要度 >= {importance_min} 的记忆。"
+
+    _footprint = footprint_reader()
+
     results = []
     token_used = 0
-    # 并发脱水：冷缓存下逐条 await 会直接超时（见 _concurrent.py）
-    summaries = await dehydrate_many(filtered)
-    for b, summary in zip(filtered, summaries):
-        if token_used >= max_tokens:
-            break
+    budget_blocked = False
+    for b in filtered:
         try:
-            if not str(summary or "").strip():
-                # Core buckets must remain readable even when dehydration fails.
-                if _is_core_bucket(b):
-                    summary = _raw_core_fallback(b["content"])
-                else:
-                    continue
-            t = count_tokens_approx(summary)
-            if token_used + t > max_tokens:
-                break
             imp = b["metadata"].get("importance", 0)
-            results.append(f"[importance:{imp}] [bucket_id:{b['id']}] {summary}")
-            token_used += t
+            rendered, entry_tokens = render_stored_bucket(
+                b,
+                f"[importance:{imp}] [bucket_id:{b['id']}]",
+                _footprint(b),
+            )
+            if token_used + entry_tokens > max_tokens:
+                budget_blocked = True
+                break
+            results.append(rendered)
+            token_used += entry_tokens
         except Exception as e:
             rt.logger.warning(f"importance_min bucket processing failed: {e}")
-    return "\n---\n".join(results) if results else "没有可以展示的记忆。"
+    if not results:
+        return _BUDGET_NOTICE if budget_blocked else "没有可以展示的记忆。"
+    if budget_blocked:
+        results.append(_BUDGET_NOTICE)
+    return "\n---\n".join(results)

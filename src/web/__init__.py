@@ -30,8 +30,10 @@ from . import github
 from . import embedding
 from . import ollama_local
 from . import config_api
-from . import v3_debug
-from . import sky
+from . import onboarding
+from . import them
+from . import you
+from . import sky  # fork: the vesper hour's feed
 
 
 _WEB_MODULES = (
@@ -51,7 +53,9 @@ _WEB_MODULES = (
     ("web.embedding", embedding.register),
     ("web.ollama_local", ollama_local.register),
     ("web.config_api", config_api.register),
-    ("web.v3_debug", v3_debug.register),
+    ("web.onboarding", onboarding.register),
+    ("web.them", them.register),
+    ("web.you", you.register),
     ("web.sky", sky.register),
 )
 

@@ -1,5 +1,17 @@
 from __future__ import annotations
 
-from ombrebrain.resilience.scanner import ResilienceFinding, ResilienceReport, V3ResilienceScanner
+from ombrebrain.resilience.recovery import (
+    CrashRecoveryContract,
+    CrashRecoveryDecision,
+    CrashRecoveryPlan,
+    PathStep,
+)
 
-__all__ = ["ResilienceFinding", "ResilienceReport", "V3ResilienceScanner"]
+__all__ = [
+    "CrashRecoveryContract",
+    "CrashRecoveryDecision",
+    "CrashRecoveryPlan",
+    "PathStep",
+    "ResilienceFinding",
+    "ResilienceReport",
+]
